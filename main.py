@@ -39,7 +39,6 @@ def cosine_similarity(vec_a, vec_b):
         return 0
     return dot_prod / (norm_a * norm_b)
 
-# Generate a random show name based on description text
 def create_random_show_name_from_description(description):
     if not description:
         return "Untitled Saga"
