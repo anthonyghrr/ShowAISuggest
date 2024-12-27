@@ -1,12 +1,11 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 import numpy as np
 import pickle
-from main import load_embeddings, match_shows, calculate_average_vector, find_similar_shows, get_shows_and_confirm  
-from thefuzz import process
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.preprocessing import normalize
-
+from main import (
+    load_embeddings, fuzzy_match_shows, cosine_similarity, create_random_show_name,
+    request_image_generation, fetch_image_status, download_and_open_image, generate_image
+)
 
 # Mocked version of load_embeddings to simulate data
 def mocked_load_embeddings(filepath):
@@ -16,66 +15,80 @@ def mocked_load_embeddings(filepath):
         "Stranger Things": np.array([0.5, 0.6, 0.7])
     }
 
-class TestShowMatcher(unittest.TestCase):
+class TestShowAISuggest(unittest.TestCase):
 
-    # Test for match_shows with valid matches
-    def test_match_shows(self):
-        show_list = ["Breaking Bad", "Better Call Saul", "Stranger Things"]
-        user_input = ["breaking bad", "stranger things"]
-        matched_shows = match_shows(user_input, show_list)
-        self.assertEqual(len(matched_shows), 2)
-        self.assertIn("Breaking Bad", matched_shows)
-        self.assertIn("Stranger Things", matched_shows)
-
-    # Test for match_shows with no matches
-    def test_match_shows_no_match(self):
-        user_input = ["Unknown Show"]
-        show_list = ["Breaking Bad", "Stranger Things"]
-        matched_shows = match_shows(user_input, show_list)
-        self.assertEqual(matched_shows, [])
-
-    # Test for calculate_average_vector
-    def test_calculate_average_vector(self):
-        embeddings = mocked_load_embeddings("/path/to/embeddings.pkl")
-        selected_shows = ["Breaking Bad", "Better Call Saul"]
-        avg_vector = calculate_average_vector(selected_shows, embeddings)
-        expected_avg = np.mean([embeddings["Breaking Bad"], embeddings["Better Call Saul"]], axis=0)
-        np.testing.assert_array_equal(avg_vector, expected_avg)
-
-    # Test for find_similar_shows
-    def test_find_similar_shows(self):
-        embeddings = mocked_load_embeddings("/path/to/embeddings.pkl")
-        avg_vector = np.array([0.15, 0.2, 0.35])
-        exclude_shows = ["Breaking Bad"]
-        recommended_shows = find_similar_shows(avg_vector, embeddings, exclude_shows)
-        self.assertEqual(len(recommended_shows), 2)
-        self.assertEqual(recommended_shows[0][0], "Better Call Saul")
-        self.assertEqual(recommended_shows[1][0], "Stranger Things")
-
-    # Test for the user input confirmation flow (valid input)
-    @patch('builtins.input', side_effect=["Breaking Bad, Better Call Saul", "y"])
-    def test_user_confirmation_valid(self, mock_input):
-        embeddings = mocked_load_embeddings("/path/to/embeddings.pkl")
-        user_input = ["breaking bad", "better call saul"]
-        matched_shows = match_shows(user_input, list(embeddings.keys()))
-        self.assertEqual(matched_shows, ["Breaking Bad", "Better Call Saul"])
-
-    # Test for the user input confirmation flow (invalid input)
-    @patch('builtins.input', side_effect=["Unknown Show", "n", "breaking bad", "y"])
-    def test_user_confirmation_invalid(self, mock_input):
-        embeddings = mocked_load_embeddings("/path/to/embeddings.pkl")
-        user_input = ["Unknown Show"]
-        matched_shows = match_shows(user_input, list(embeddings.keys()))
-        self.assertEqual(matched_shows, [])
-
-    # Test for loading embeddings with mocked data
-    @patch('builtins.open', unittest.mock.mock_open(read_data=pickle.dumps(mocked_load_embeddings("/path/to/embeddings.pkl"))))
-    def test_load_embeddings(self):
+    @patch('builtins.open', new_callable=unittest.mock.mock_open, read_data=pickle.dumps(mocked_load_embeddings("/path/to/embeddings.pkl")))
+    def test_load_embeddings(self, mock_open):
         embeddings = load_embeddings("/Users/anthonyghandour/Desktop/ShowAISuggest/src/data/embeddings.pkl")
         self.assertEqual(len(embeddings), 3)
         self.assertIn("Breaking Bad", embeddings)
         self.assertEqual(embeddings["Breaking Bad"].tolist(), [0.1, 0.2, 0.3])
 
+    def test_fuzzy_match_shows(self):
+        all_show_titles = ["Breaking Bad", "Better Call Saul", "Stranger Things"]
+        user_input_shows = ["breaking bad", "stranger things"]
+        matched_shows = fuzzy_match_shows(user_input_shows, all_show_titles)
+        self.assertEqual(matched_shows, ["Breaking Bad", "Stranger Things"])
+
+    def test_cosine_similarity(self):
+        vec_a = np.array([1, 2, 3])
+        vec_b = np.array([4, 5, 6])
+        similarity = cosine_similarity(vec_a, vec_b)
+        expected_similarity = np.dot(vec_a, vec_b) / (np.linalg.norm(vec_a) * np.linalg.norm(vec_b))
+        self.assertAlmostEqual(similarity, expected_similarity)
+
+    def test_create_random_show_name(self):
+        source_shows = ["Breaking Bad", "Better Call Saul"]
+        random_show_name = create_random_show_name(source_shows)
+        self.assertTrue(isinstance(random_show_name, str))
+        self.assertGreater(len(random_show_name), 0)
+
+    @patch('requests.post')
+    def test_request_image_generation(self, mock_post):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"body": {"orderId": "12345"}}
+        mock_post.return_value = mock_response
+
+        prompt = "A scene from Breaking Bad"
+        order_id = request_image_generation(prompt)
+        self.assertEqual(order_id, "12345")
+
+    @patch('requests.post')
+    def test_fetch_image_status(self, mock_post):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"body": {"status": "completed", "output": "http://example.com/image.jpg"}}
+        mock_post.return_value = mock_response
+
+        order_id = "12345"
+        image_url = fetch_image_status(order_id)
+        self.assertEqual(image_url, "http://example.com/image.jpg")
+
+    @patch('requests.get')
+    @patch('os.system')
+    def test_download_and_open_image(self, mock_system, mock_get):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.content = b'image data'
+        mock_get.return_value = mock_response
+
+        image_url = "http://example.com/image.jpg"
+        filename = "test_image.jpg"
+        download_and_open_image(image_url, filename)
+        mock_get.assert_called_with(image_url)
+        mock_system.assert_called_with(f'open {filename}')
+
+    @patch('main.request_image_generation', return_value="12345")
+    @patch('main.fetch_image_status', return_value="http://example.com/image.jpg")
+    @patch('main.download_and_open_image')
+    def test_generate_image(self, mock_download, mock_fetch, mock_request):
+        prompt = "A scene from Breaking Bad"
+        filename = generate_image(prompt)
+        self.assertEqual(filename, "A_scene_from_Breaking_Bad.jpg")
+        mock_request.assert_called_with(prompt.strip())
+        mock_fetch.assert_called_with("12345")
+        mock_download.assert_called_with("http://example.com/image.jpg", "A_scene_from_Breaking_Bad.jpg")
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,67 +1,200 @@
 import pickle
-from thefuzz import process
+from dotenv import load_dotenv
+import requests
 import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.preprocessing import normalize
+import random
+import time
+import os
+from thefuzz import process
+import json
+from colorama import init, Fore, Style
+from requests import HTTPError
+import re
+
+# Initialize colorama
+init(autoreset=True)
+
+# Load environment variables
+load_dotenv()
+LIGHTX_API_KEY = os.getenv('LIGHTX_API_KEY')
+EMBEDDINGS_PATH = "/Users/anthonyghandour/Desktop/ShowAISuggest/src/data/embeddings.pkl"
 
 def load_embeddings(filepath):
     with open(filepath, "rb") as f:
-        embeddings = pickle.load(f)
-    return embeddings
+        return pickle.load(f)
 
-def match_shows(user_input, show_list):
-    matching_shows = []
-    for show in user_input:
-        match = process.extractOne(show, show_list)
-        if match is not None:
-            match_show, match_score = match
-            if match_score >= 70:  
-                matching_shows.append(match_show)
-    return matching_shows
+def fuzzy_match_shows(user_input_shows, all_show_titles):
+    matched = []
+    for show in user_input_shows:
+        best_title, best_score = process.extractOne(show, all_show_titles)
+        if best_score >= 70:
+            matched.append(best_title)
+    return matched
 
-def calculate_average_vector(selected_shows, embeddings):
-    vectors = []
-    for show in selected_shows:
-        vectors.append(embeddings.get(show))
-    avg_vector = np.mean(vectors, axis=0)
-    return avg_vector  
+def cosine_similarity(vec_a, vec_b):
+    dot_prod = np.dot(vec_a, vec_b)
+    norm_a = np.linalg.norm(vec_a)
+    norm_b = np.linalg.norm(vec_b)
+    if norm_a == 0 or norm_b == 0:
+        return 0
+    return dot_prod / (norm_a * norm_b)
 
-def find_similar_shows(avg_vector, embeddings, exclude_shows):
-    results = []
-    normalized_avg_vector = normalize([avg_vector])[0]
+# Generate a random show name based on description text
+def create_random_show_name_from_description(description):
+    if not description:
+        return "Untitled Saga"
+
+    ignore_words = {"of", "the", "and", "a", "to", "in", "on", "for", "from", "by", "with", "as", "at", "this", "that"}
+
+    words = re.findall(r'\b\w{3,}\b', description.lower())  
+    filtered_words = [word.capitalize() for word in words if word not in ignore_words]
     
-    for title, vector in embeddings.items():
-        if title not in exclude_shows:
-            normalized_vector = normalize([vector])[0]
-            similarity = cosine_similarity([normalized_avg_vector], [normalized_vector])[0][0]
-            results.append((title, similarity))
-    
-    return sorted(results, key=lambda x: x[1], reverse=True)[:5]
+    if not filtered_words:
+        return "Mysterious Saga"
+    num_words = random.choice([1, 2, 3])
+    name_words = random.sample(filtered_words, k=min(num_words, len(filtered_words)))
+    return " ".join(name_words)
 
-def get_shows_and_confirm(embeddings):
-    while True:
-        user_input = input("Which TV shows did you really like watching? Separate them by a comma. Make sure to enter more than 1 show\n")
-        shows_list = user_input.split(",")
-        user_shows = [show.strip() for show in shows_list]
-        matched_shows = match_shows(user_shows, list(embeddings.keys()))
+def request_image_generation(prompt: str):
+    url = 'https://api.lightxeditor.com/external/api/v1/text2image'
+    headers = {
+        'Content-Type': 'application/json',
+        'x-api-key': LIGHTX_API_KEY
+    }
+    data = {"textPrompt": str(prompt)}
+    response = requests.post(url, headers=headers, json=data)
+    if response.status_code == 200:
+        return response.json()["body"]["orderId"]
+    else:
+        print(f"{Fore.RED}Request failed with status code: {response.status_code}")
+        print(response.json())
+        return None
 
-        if matched_shows:
-            print(f"Do you mean {', '.join(matched_shows)}? (y/n)")
-            if input().lower() == 'y':
-                print(f"Great! Proceeding with the following shows: {', '.join(matched_shows)}")
-                avg_vector = calculate_average_vector(matched_shows, embeddings)
-                recommended_shows = find_similar_shows(avg_vector, embeddings, matched_shows)
-                print("We recommend the following shows based on your preferences:")
-                for show, similarity in recommended_shows:
-                    print(f"{show} ({similarity * 100:.0f}%)")
+def fetch_image_status(order_id: str) -> str:
+    WAIT_TIME = 3
+    MAX_TRIES = 5
 
-                break
+    url = 'https://api.lightxeditor.com/external/api/v1/order-status'
+    headers = {
+        'Content-Type': 'application/json',
+        'x-api-key': LIGHTX_API_KEY
+    }
+    payload = {"orderId": order_id}
+
+    for _ in range(MAX_TRIES):
+        time.sleep(WAIT_TIME)
+        response = requests.post(url, headers=headers, data=json.dumps(payload))
+        if response.status_code == 200:
+            status = response.json()["body"]["status"]
+            if status == 'init':
+                continue
+            elif status == 'failed':
+                raise Exception("Image Generation Failed")
             else:
-                print("Please re-enter the shows with correct spelling.")
+                return response.json()["body"]['output']
         else:
-            print("Sorry, no matches found. Please check your spelling and try again.")
+            raise HTTPError(f"Error: Received status code {response.status_code}")
+
+def download_and_open_image(image_url: str, filename: str):
+    response = requests.get(image_url)
+    if response.status_code == 200:
+        with open(filename, 'wb') as f:
+            f.write(response.content)
+        os.system(f'open {filename}')
+    else:
+        print(f"{Fore.RED}Failed to download image from {image_url}")
+
+def generate_image(prompt, show_name):
+    order_id = request_image_generation(prompt.strip())
+    if order_id:
+        image_url = fetch_image_status(order_id)
+        if image_url:
+            filename = f"{show_name.replace(' ', '_')}.jpg"
+            download_and_open_image(image_url, filename)
+            return filename
+    return None
+
+def main():
+    embeddings = load_embeddings(EMBEDDINGS_PATH)
+    all_show_titles = list(embeddings.keys())
+
+    while True:
+        user_input = input(
+            f"{Fore.CYAN}Which TV shows did you really like watching? "
+            "Separate them by a comma. Make sure to enter more than 1 show\n"
+        )
+        user_shows_raw = [s.strip() for s in user_input.split(",") if s.strip()]
+
+        if len(user_shows_raw) < 2:
+            print(f"{Fore.RED}Please enter at least 2 shows!\n")
+            continue
+
+        matched_shows = fuzzy_match_shows(user_shows_raw, all_show_titles)
+        if not matched_shows:
+            print(f"{Fore.RED}No matches found. Try again.\n")
+            continue
+
+        print(f"{Fore.YELLOW}Making sure, do you mean {', '.join(matched_shows)}? (y/n)")
+        confirm = input().lower().strip()
+        if confirm == 'y':
+            break
+        else:
+            print(f"{Fore.CYAN}Ok let's try again.\n")
+
+    print(f"{Fore.GREEN}Great! Generating recommendations now...")
+
+    user_vectors = [embeddings[s] for s in matched_shows]
+    avg_vector = np.mean(user_vectors, axis=0)
+
+    rec_list = []
+    for show_title, vec in embeddings.items():
+        if show_title in matched_shows:
+            continue
+        sim = cosine_similarity(avg_vector, vec)
+        rec_list.append((show_title, sim))
+
+    rec_list.sort(key=lambda x: x[1], reverse=True)
+
+    top_five = rec_list[:5]
+
+    recommended_shows = []
+    for (title, sim) in top_five:
+        pct = (sim + 1) * 50
+        pct = max(0, min(100, pct))
+        recommended_shows.append((title, pct))
+
+    print(f"{Fore.GREEN}\nHere are the TV shows that I think you would love:")
+    for title, pct in recommended_shows:
+        print(f"{Fore.GREEN}{title} ({pct:.0f}%)")
+    print()
+
+    show1_name = create_random_show_name_from_description(f"A thrilling saga inspired by {', '.join(matched_shows)}.")
+    show1_desc = f"A thrilling saga inspired by {', '.join(matched_shows)}."
+    show1_prompt = f"A scene from {show1_name}, inspired by {', '.join(matched_shows)}. The show name is {show1_name}."
+
+    show2_name = create_random_show_name_from_description(f"A masterpiece blending the themes of {', '.join(title for title, _ in recommended_shows)}.")
+    show2_desc = f"A masterpiece blending the themes of {', '.join(title for title, _ in recommended_shows)}."
+    show2_prompt = f"A scene from {show2_name}, inspired by {', '.join(title for title, _ in recommended_shows)}. The show name is {show2_name}."
+
+    try:
+        print(
+            f"{Fore.CYAN}\nI have also created just for you two custom shows which I think you would love.\n\n"
+            f"{Style.RESET_ALL}Show #1 is based on the fact that you loved the input shows that you gave me. "
+            f"Its name is {Fore.YELLOW}{Style.BRIGHT}{show1_name}{Style.RESET_ALL} and it is about {show1_desc}.\n"
+        )
+        time.sleep(2)
+        generate_image(show1_prompt, show1_name)
+
+        print(
+            f"\nShow #2 is based on the shows that I recommended for you. "
+            f"Its name is {Fore.YELLOW}{Style.BRIGHT}{show2_name}{Style.RESET_ALL} and it is about {show2_desc}.\n"
+            f"{Fore.CYAN}Hope you like them!{Style.RESET_ALL}\n"
+        )
+        time.sleep(2)
+        generate_image(show2_prompt, show2_name)
+
+    except Exception as e:
+        print(f"{Fore.RED}Image generation failed: {e}")
 
 if __name__ == "__main__":
-    # Load embeddings with the updated path
-    embeddings = load_embeddings("/Users/anthonyghandour/Desktop/ShowAISuggest/src/data/embeddings.pkl")
-    get_shows_and_confirm(embeddings)
+    main()
